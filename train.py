@@ -15,17 +15,17 @@ from torch.autograd import Variable
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import torch.backends.cudnn as cudnn
-import torch.nn.init as init
 import torch.utils.data as data
 import numpy as np
 import argparse
 import datetime
 from utils.tensorboard_helper import SummaryHelper
+import utils.misc as misc
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from utils.logging_helper import setup_logger
 import logging
+import random
 
 # Oof
 import eval as eval_script
@@ -64,7 +64,7 @@ parser.add_argument('--gamma', default=None, type=float,
                     help='For each lr step, what to multiply the lr by. Leave as None to read this from the config.')
 parser.add_argument('--save_folder', default='weights/',
                     help='Directory for saving checkpoint models')
-parser.add_argument('--log_folder', default='../../logs/',
+parser.add_argument('--log_folder', default='logs/',
                     help='Directory for saving Tensorboard logs')
 parser.add_argument('--config', default=None,
                     help='The config object to use.')
@@ -88,6 +88,8 @@ parser.add_argument('--drop_weights', default=None, type=str,
                     help='Drop specified weights (split by comma) from existing model.')
 parser.add_argument('--interrupt_no_save', dest='interrupt_no_save', action='store_true',
                     help='Just exit when keyboard interrupt occurs for testing.')
+parser.add_argument('--no_warmup_rescale', dest='warmup_rescale', action='store_false',
+                    help='Do not rescale warmup coefficients on multiple GPU training.')
 
 parser.set_defaults(keep_latest=False)
 args = parser.parse_args()
@@ -124,43 +126,19 @@ else:
     torch.set_default_tensor_type('torch.FloatTensor')
 
 
-class ScatterWrapper:
-    """ Input is any number of lists. This will preserve them through a dataparallel scatter. """
-    def __init__(self, *args):
-        for arg in args:
-            if not isinstance(arg, list):
-                print('Warning: ScatterWrapper got input of non-list type.')
-        self.args = args
-        self.batch_size = len(args[0])
-    
-    def make_mask(self):
-        out = torch.Tensor(list(range(self.batch_size))).long()
-        if args.cuda: return out.cuda()
-        else: return out
-    
-    def get_args(self, mask):
-        device = mask.device
-        mask = [int(x) for x in mask]
-        out_args = [[] for _ in self.args]
-
-        for out, arg in zip(out_args, self.args):
-            for idx in mask:
-                x = arg[idx]
-                if isinstance(x, torch.Tensor):
-                    x = x.to(device)
-                out.append(x)
-        
-        return out_args
-
-
 def multi_gpu_rescale(args):
     # auto rescale parameters when GPU count > 1 or batch size is not 8
     scale_factor = args.num_gpus * args.batch_size // 8
     args.lr *= scale_factor
     global lr
     lr = args.lr
+
+    if args.warmup_rescale:
+        cfg.lr_warmup_init = 0
+        cfg.lr_warmup_until = 1000
+
     args.save_interval = args.save_interval // scale_factor
-    cfg.lr_warmup_init *= scale_factor
+    # cfg.lr_warmup_init *= scale_factor
     cfg.max_iter = cfg.max_iter // scale_factor
     cfg.lr_steps = tuple([lr_step // scale_factor for lr_step in cfg.lr_steps])
 
@@ -171,6 +149,12 @@ def train(rank, args):
     if rank == 0:
         if not os.path.exists(args.save_folder):
             os.mkdir(args.save_folder)
+
+    # fix the seed for reproducibility
+    seed = args.random_seed + rank
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
 
     # set up logger
     setup_logger(output=os.path.join(args.log_folder, cfg.name), distributed_rank=rank)
@@ -184,19 +168,20 @@ def train(rank, args):
         w.add_text("git_hash", repo.head.object.hexsha)
         logger.info("git hash: {}".format(repo.head.object.hexsha))
 
-    try:
-        logger.info("Initializing torch.distributed backend...")
-        dist.init_process_group(
-            backend='nccl',
-            init_method=args.dist_url,
-            world_size=args.num_gpus,
-            rank=rank
-        )
-    except Exception as e:
-        logger.error("Process group URL: {}".format(args.dist_url))
-        raise e
+    if args.num_gpus > 1:
+        try:
+            logger.info("Initializing torch.distributed backend...")
+            dist.init_process_group(
+                backend='nccl',
+                init_method=args.dist_url,
+                world_size=args.num_gpus,
+                rank=rank
+            )
+        except Exception as e:
+            logger.error("Process group URL: {}".format(args.dist_url))
+            raise e
 
-    dist.barrier()
+    misc.barrier()
 
     if torch.cuda.device_count() > 1:
         logger.info('Multiple GPUs detected! Turning off JIT.')
@@ -281,21 +266,17 @@ def train(rank, args):
                                 negpos_ratio=3)
 
     if args.cuda:
-        cudnn.benchmark = True
         net.cuda(rank)
-        criterion.cuda(rank)
-        net = nn.parallel.DistributedDataParallel(net, device_ids=[rank], output_device=rank, broadcast_buffers=False,
-                                                  find_unused_parameters=True)
-        # net       = nn.DataParallel(net).cuda()
-        # criterion = nn.DataParallel(criterion).cuda()
+
+        if misc.is_distributed_initialized():
+            net = nn.parallel.DistributedDataParallel(net, device_ids=[rank], output_device=rank, broadcast_buffers=False,
+                                                      find_unused_parameters=True)
 
     optimizer = optim.SGD(filter(lambda x: x.requires_grad, net.parameters()),
                           lr=args.lr, momentum=args.momentum,
                           weight_decay=args.decay)
 
     # loss counters
-    loc_loss = 0
-    conf_loss = 0
     iteration = max(args.start_iter, 0)
     w.set_step(iteration)
     last_time = time.time()
@@ -330,8 +311,6 @@ def train(rank, args):
                                             batch_sampler=joint_train_sampler)
         joint_data_loader_iter = iter(joint_data_loader)
 
-    dist.barrier()
-    
     save_path = lambda epoch, iteration: SavePath(cfg.name, epoch, iteration).get_path(root=args.save_folder)
     time_avg = MovingAverage()
     data_time_avg = MovingAverage(10)
@@ -343,8 +322,7 @@ def train(rank, args):
         optimizer.zero_grad()
 
         out = net_outs["pred_outs"]
-        wrapper = ScatterWrapper(targets, masks, num_crowds)
-        losses = criterion(out, wrapper, wrapper.make_mask())
+        losses = criterion(out, targets, masks, num_crowds)
 
         losses = {k: v.mean() for k, v in losses.items()}  # Mean here because Dataparallel
 
@@ -377,7 +355,6 @@ def train(rank, args):
             while True:
                 data_start_time = time.perf_counter()
                 datum = next(data_loader_iter)
-                dist.barrier()
                 data_end_time = time.perf_counter()
                 data_time = data_end_time - data_start_time
                 if iteration != args.start_iter:
@@ -444,7 +421,6 @@ def train(rank, args):
                 elif cfg.dataset.joint or not cfg.dataset.is_video:
                     if cfg.dataset.joint:
                         joint_datum = next(joint_data_loader_iter)
-                        dist.barrier()
                         # Load training data
                         # Note, for training on multiple gpus this will use the custom replicate and gather I wrote up there
                         images, targets, masks, num_crowds = prepare_data(joint_datum)
@@ -453,25 +429,8 @@ def train(rank, args):
                     extras = {"backbone": "full", "interrupt": False,
                               "moving_statistics": {"aligned_feats": []}}
                     net_outs = net(images,extras=extras)
-                    out = net_outs["pred_outs"]
-                    # Compute Loss
-                    optimizer.zero_grad()
-
-                    wrapper = ScatterWrapper(targets, masks, num_crowds)
-                    losses = criterion(out, wrapper, wrapper.make_mask())
-
-                    losses = { k: v.mean() for k,v in losses.items() } # Mean here because Dataparallel
-                    loss = sum([losses[k] for k in losses])
-
-                    # Backprop
-                    loss.backward() # Do this to free up vram even if loss is not finite
-                    if torch.isfinite(loss).item():
-                        optimizer.step()
-
-                    # Add the loss to the moving average for bookkeeping
-                    for k in losses:
-                        loss_avgs[k].add(losses[k].item())
-                        w.add_scalar('joint/%s' % k, losses[k].item())
+                    run_name = "joint" if cfg.dataset.joint else "compute"
+                    losses = backward_and_log(run_name, net_outs, targets, masks, num_crowds)
 
                 # Forward Pass
                 if cfg.dataset.is_video:
@@ -634,15 +593,18 @@ time: {time}  data_time: {data_time}  lr: {lr}  {memory}\
                         if args.keep_latest_interval <= 0 or iteration % args.keep_latest_interval != args.save_interval:
                             logger.info('Deleting old save...')
                             os.remove(latest)
-            
+
+            misc.barrier()
+
             # This is done per epoch
             if args.validation_epoch > 0:
                 if epoch % args.validation_epoch == 0 and epoch > 0:
                     if rank == 0:
                         compute_validation_map(yolact_net, val_dataset)
-                    dist.barrier()
+                    misc.barrier()
 
     except KeyboardInterrupt:
+        misc.barrier()
         if args.interrupt_no_save:
             logger.info('No save on interrupt, just exiting...')
         elif rank == 0:
@@ -705,8 +667,7 @@ def compute_validation_loss(net, data_loader, criterion):
             images, targets, masks, num_crowds = prepare_data(datum)
             out = net(images)
 
-            wrapper = ScatterWrapper(targets, masks, num_crowds)
-            _losses = criterion(out, wrapper, wrapper.make_mask())
+            _losses = criterion(out, targets, masks, num_crowds)
             
             for k, v in _losses.items():
                 v = v.mean().item()

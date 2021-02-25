@@ -42,7 +42,10 @@ def postprocess(det_output, w, h, batch_idx=0, interpolation_mode='bilinear',
 
         for k in dets:
             if k != 'proto':
-                dets[k] = dets[k][keep]
+                if cfg.use_tensorrt_safe_mode:
+                    dets[k] = torch.index_select(dets[k], 0, torch.nonzero(keep, as_tuple=True)[0])
+                else:
+                    dets[k] = dets[k][keep]
         
         if dets['score'].size(0) == 0:
             return [torch.Tensor()] * 4
@@ -84,7 +87,7 @@ def postprocess(det_output, w, h, batch_idx=0, interpolation_mode='bilinear',
         if visualize_lincomb:
             display_lincomb(proto_data, masks)
 
-        masks = torch.matmul(proto_data, masks.t())
+        masks = proto_data @ masks.t()
         masks = cfg.mask_proto_mask_activation(masks)
 
         # Crop masks before upsampling because you know why

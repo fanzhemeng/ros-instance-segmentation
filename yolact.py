@@ -6,7 +6,8 @@ import numpy as np
 from functools import partial
 from itertools import product, chain
 from math import sqrt
-from typing import List, Tuple
+from typing import List, Tuple, Optional
+from torch import Tensor
 
 from data.config import cfg, mask_type
 from layers import Detect
@@ -36,7 +37,6 @@ torch.cuda.current_device()
 
 # As of March 10, 2019, Pytorch DataParallel still doesn't support JIT Script Modules
 use_jit = False if use_torch2trt else torch.cuda.device_count() <= 1
-NoneTensor = None if use_torch2trt else torch.Tensor()
 
 ScriptModuleWrapper = torch.jit.ScriptModule if use_jit else nn.Module
 script_method_wrapper = torch.jit.script_method if use_jit else lambda fn, _rcn=None: fn
@@ -814,7 +814,7 @@ class FlowNetMiniTRT(ScriptModuleWrapper):
 
 
 class SPA(ScriptModuleWrapper):
-    __constants__ = ['interpolation_mode', 'refine_convs', 'use_normalized_spa']
+    __constants__ = ['interpolation_mode', 'use_normalized_spa']
 
     def __init__(self, num_layers):
         super().__init__()
@@ -855,7 +855,7 @@ class SPA(ScriptModuleWrapper):
 
 
 class FPN_phase_1(ScriptModuleWrapper):
-    __constants__ = ['interpolation_mode', 'lat_layers']
+    __constants__ = ['interpolation_mode']
 
     def __init__(self, in_channels):
         super().__init__()
@@ -870,7 +870,8 @@ class FPN_phase_1(ScriptModuleWrapper):
         self.interpolation_mode = cfg.fpn.interpolation_mode
 
     @script_method_wrapper
-    def forward(self, x1=NoneTensor, x2=NoneTensor, x3=NoneTensor, x4=NoneTensor, x5=NoneTensor, x6=NoneTensor, x7=NoneTensor):
+    def forward(self, x1=None, x2=None, x3=None, x4=None, x5=None, x6=None, x7=None):
+        # type: (Optional[Tensor], Optional[Tensor], Optional[Tensor], Optional[Tensor], Optional[Tensor], Optional[Tensor], Optional[Tensor]) -> List[Tensor]
         """
         Args:
             - convouts (list): A list of convouts for the corresponding layers in in_channels.
@@ -879,20 +880,21 @@ class FPN_phase_1(ScriptModuleWrapper):
         """
 
         convouts_ = [x1, x2, x3, x4, x5, x6, x7]
+        # convouts = [x for x in convouts if x is not None]
         convouts = []
         j = 0
         while j < len(convouts_):
-            if convouts_[j] is not None and convouts_[j].size(0):
-                convouts.append(convouts_[j])
+            t = convouts_[j]
+            if t is not None:
+                convouts.append(t)
             j += 1
-        # convouts = [x for x in convouts if x is not None]
 
         out = []
-        lat_layers = []
+        lat_feats = []
         x = torch.zeros(1, device=convouts[0].device)
         for i in range(len(convouts)):
             out.append(x)
-            lat_layers.append(x)
+            lat_feats.append(x)
 
         # For backward compatability, the conv layers are stored in reverse but the input and output is
         # given in the correct order. Thus, use j=-i-1 for the input and output and i for the conv layers.
@@ -904,17 +906,17 @@ class FPN_phase_1(ScriptModuleWrapper):
                 _, _, h, w = convouts[j].size()
                 x = F.interpolate(x, size=(h, w), mode=self.interpolation_mode, align_corners=False)
             lat_j = lat_layer(convouts[j])
-            lat_layers[j] = lat_j
+            lat_feats[j] = lat_j
             x = x + lat_j
             out[j] = x
         
         for i in range(len(convouts)):
-            out.append(lat_layers[i])
+            out.append(lat_feats[i])
         return out
 
 
 class FPN_phase_2(ScriptModuleWrapper):
-    __constants__ = ['num_downsample', 'use_conv_downsample', 'pred_layers', 'downsample_layers']
+    __constants__ = ['num_downsample', 'use_conv_downsample']
 
     def __init__(self, in_channels):
         super().__init__()
@@ -938,7 +940,8 @@ class FPN_phase_2(ScriptModuleWrapper):
         self.use_conv_downsample = cfg.fpn.use_conv_downsample
 
     @script_method_wrapper
-    def forward(self, x1=NoneTensor, x2=NoneTensor, x3=NoneTensor, x4=NoneTensor, x5=NoneTensor, x6=NoneTensor, x7=NoneTensor):
+    def forward(self, x1=None, x2=None, x3=None, x4=None, x5=None, x6=None, x7=None):
+        # type: (Optional[Tensor], Optional[Tensor], Optional[Tensor], Optional[Tensor], Optional[Tensor], Optional[Tensor], Optional[Tensor]) -> List[Tensor]
         """
         Args:
             - convouts (list): A list of convouts for the corresponding layers in in_channels.
@@ -953,8 +956,9 @@ class FPN_phase_2(ScriptModuleWrapper):
         out = []
         j = 0
         while j < len(out_):
-            if out_[j] is not None and out_[j].size(0):
-                out.append(out_[j])
+            t = out_[j]
+            if t is not None:
+                out.append(t)
             j += 1
 
         len_convouts = len(out)
@@ -991,8 +995,7 @@ class FPN(ScriptModuleWrapper):
         - in_channels (list): For each conv layer you supply in the forward pass,
                               how many features will it have?
     """
-    __constants__ = ['interpolation_mode', 'num_downsample', 'use_conv_downsample',
-                     'lat_layers', 'pred_layers', 'downsample_layers']
+    __constants__ = ['interpolation_mode', 'num_downsample', 'use_conv_downsample']
 
     def __init__(self, in_channels):
         super().__init__()
@@ -1113,9 +1116,6 @@ class Yolact(nn.Module):
             # The include_last_relu=false here is because we might want to change it to another function
             self.proto_net, cfg.mask_dim = make_net(in_channels, cfg.mask_proto_net, include_last_relu=False)
 
-            if cfg.flow is not None and cfg.flow.proto_net_no_conflict:
-                self.proto_net_proxy, _ = make_net(in_channels, cfg.mask_proto_net, include_last_relu=False)
-
             if cfg.mask_proto_bias:
                 cfg.mask_dim += 1
 
@@ -1128,9 +1128,7 @@ class Yolact(nn.Module):
             if cfg.flow is not None:
                 self.fpn_phase_1 = FPN_phase_1([src_channels[i] for i in self.selected_layers])
                 self.fpn_phase_2 = FPN_phase_2([src_channels[i] for i in self.selected_layers])
-                if cfg.flow.fpn_no_conflict:
-                    self.fpn_phase_2_proxy = FPN_phase_2([src_channels[i] for i in self.selected_layers])
-                if cfg.flow.use_spa or cfg.flow.use_spa_both:
+                if cfg.flow.use_spa:
                     self.spa = SPA(len(self.selected_layers))
                 if cfg.flow.warp_mode == 'flow':
                     if cfg.flow.model == 'mini':
@@ -1166,22 +1164,6 @@ class Yolact(nn.Module):
                                     index         = idx)
             self.prediction_layers.append(pred)
 
-        if cfg.flow is not None and cfg.flow.pred_heads_no_conflict:
-            self.prediction_layers_proxy = nn.ModuleList()
-
-            for idx, layer_idx in enumerate(self.selected_layers):
-                # If we're sharing prediction module weights, have every module's parent be the first one
-                parent = None
-                if cfg.share_prediction_module and idx > 0:
-                    parent = self.prediction_layers_proxy[0]
-
-                pred = PredictionModule(src_channels[layer_idx], src_channels[layer_idx],
-                                        aspect_ratios = cfg.backbone.pred_aspect_ratios[idx],
-                                        scales        = cfg.backbone.pred_scales[idx],
-                                        parent        = parent,
-                                        index         = idx)
-                self.prediction_layers_proxy.append(pred)
-
         # Extra parameters for the extra losses
         if cfg.use_class_existence_loss:
             # This comes from the smallest layer selected
@@ -1200,13 +1182,15 @@ class Yolact(nn.Module):
     
     def load_weights(self, path, args=None):
         """ Loads weights from a compressed save file. """
-        state_dict = torch.load(path, map_location=torch.device(torch.cuda.current_device()))
+        state_dict = torch.load(path, map_location='cpu')
 
         # Get all possible weights
         cur_state_dict = self.state_dict()
 
         if args is not None and args.drop_weights is not None:
             drop_weight_keys = args.drop_weights.split(',')
+        
+        transfered_from_yolact = False
 
         for key in list(state_dict.keys()):
             # For backward compatability, remove these (the new variable is called layers)
@@ -1224,13 +1208,14 @@ class Yolact(nn.Module):
                         if key.startswith(drop_key):
                             del state_dict[key]
 
-                if args.yolact_transfer or args.coco_transfer:
-                    if key.startswith('fpn.lat_layers'):
-                        state_dict[key.replace('fpn.', 'fpn_phase_1.')] = state_dict[key]
-                        del state_dict[key]
-                    elif key.startswith('fpn.') and key in state_dict:
-                        state_dict[key.replace('fpn.', 'fpn_phase_2.')] = state_dict[key]
-                        del state_dict[key]
+                if key.startswith('fpn.lat_layers'):
+                    transfered_from_yolact = True
+                    state_dict[key.replace('fpn.', 'fpn_phase_1.')] = state_dict[key]
+                    del state_dict[key]
+                elif key.startswith('fpn.') and key in state_dict:
+                    transfered_from_yolact = True
+                    state_dict[key.replace('fpn.', 'fpn_phase_2.')] = state_dict[key]
+                    del state_dict[key]
 
         keys_not_exist = []
         keys_not_used = []
@@ -1270,8 +1255,8 @@ class Yolact(nn.Module):
             logger.warning("Some parameters in the checkpoint have a different shape in the current model, "
                            "and are initialized as they should be: {}".format(", ".join(keys_mismatch)))
 
-        if args.coco_transfer:
-            logger.warning("`--coco_transfer` is deprecated, please use `--yolact_transfer` instead.")
+        if args.coco_transfer or args.yolact_transfer:
+            logger.warning("`--coco_transfer` or `--yolact_transfer` is no longer needed. The code will automatically detect and convert YOLACT-trained weights now.")
 
         self.load_state_dict(state_dict)
 
@@ -1283,7 +1268,7 @@ class Yolact(nn.Module):
     def init_weights(self, backbone_path):
         """ Initialize weights for training. """
         # Initialize the backbone with the pretrained weights.
-        self.backbone.init_backbone(backbone_path, map_location=torch.device(torch.cuda.current_device()))
+        self.backbone.init_backbone(backbone_path)
 
         conv_constants = getattr(nn.Conv2d(1, 1, 1), '__constants__')
         
@@ -1385,7 +1370,6 @@ class Yolact(nn.Module):
         # feature matching loss
         if cfg.flow.feature_matching_loss is not None:
             def t(fea, layer_idx):
-                assert not cfg.flow.fpn_no_conflict
                 fpn_net = self.fpn_phase_2
                 pred_layer = fpn_net.pred_layers[layer_idx + 1]
                 bias = pred_layer.bias.detach() if pred_layer.bias is not None else None
@@ -1427,57 +1411,6 @@ class Yolact(nn.Module):
             loss_W /= len(pairs)
             losses['W'] = loss_W * cfg.flow.fm_loss_alpha
         return losses
-
-    @staticmethod
-    def visualize_nonlocal(net_outs, prev_images, cur_images):
-        from random import random
-        import cv2
-        from layers.output_utils import undo_image_transformation
-        import itertools
-
-        target_size = (64, 64)
-        prev_image = F.interpolate(prev_images, target_size, mode='area')[0]
-        cur_image = F.interpolate(cur_images, target_size, mode='area')[0]
-
-        prev_image = undo_image_transformation(prev_image, target_size[0], target_size[1]).astype('float32')
-        cur_image_ = undo_image_transformation(cur_image, target_size[0], target_size[1]).astype('float32')
-
-        images_stack = []
-        image_hw = target_size[0]
-
-        num_grids = 5
-        for hh, ww in itertools.product(range(num_grids), range(num_grids)):
-            ratio_hh = hh / num_grids
-            ratio_ww = ww / num_grids
-            rand_hh, rand_ww = int(ratio_hh * image_hw), int(ratio_ww * image_hw)
-
-            cur_image = cur_image_.copy()
-            cur_image[rand_hh, rand_ww, :] = (1, 0, 0)
-            images_stack.append(prev_image.transpose(2, 0, 1))
-            images_stack.append(cur_image.transpose(2, 0, 1))
-
-            for nl_cache in net_outs["nl_caches"]:
-                feat_hw = int(nl_cache.size(1) ** 0.5)
-                inter_hw = int(nl_cache.size(2) ** 0.5)
-                nl_cache = nl_cache.view(-1, feat_hw, feat_hw, inter_hw, inter_hw)
-
-                rand_h = int(feat_hw / image_hw * rand_hh)
-                rand_w = int(feat_hw / image_hw * rand_ww)
-
-                heat_map = nl_cache[0, rand_h, rand_w].data.cpu().numpy()
-
-                heat_map_min, heat_map_max = heat_map.min(), heat_map.max()
-                heat_map = (heat_map - heat_map_min) / (heat_map_max - heat_map_min)
-                heat_map_u8 = (heat_map * 255).astype('uint8')
-                heat_map_image = cv2.applyColorMap(heat_map_u8, cv2.COLORMAP_JET)
-                heat_map_image = cv2.resize(heat_map_image, target_size)
-                heat_map_image = (heat_map_image / 255.0).astype('float32')
-
-                blend_ratio = 0.6
-                heatmap = cv2.addWeighted(heat_map_image, blend_ratio, prev_image, 1.0 - blend_ratio, 0)
-                heatmap = heatmap.transpose(2, 0, 1)
-                images_stack.append(heatmap)
-        return images_stack
 
     def forward_flow(self, extras):
         imgs_1, imgs_2 = extras
@@ -1767,11 +1700,7 @@ class Yolact(nn.Module):
 
                     outs_wrapper["outs_phase_1"] = outs_phase_1.copy()
 
-                fpn_phase_2 = self.fpn_phase_2_proxy \
-                    if cfg.flow is not None and cfg.flow.fpn_no_conflict and extras["backbone"] == "partial" \
-                    else self.fpn_phase_2
-
-                outs = fpn_phase_2(*outs_phase_1)
+                outs = self.fpn_phase_2(*outs_phase_1)
                 if extras["backbone"] == "partial":
                     outs_wrapper["outs_phase_2"] = [out for out in outs]
                 else:
@@ -1794,10 +1723,7 @@ class Yolact(nn.Module):
                     grids = self.grid.repeat(proto_x.size(0), 1, 1, 1)
                     proto_x = torch.cat([proto_x, grids], dim=1)
 
-                if cfg.flow is not None and cfg.flow.proto_net_no_conflict and extras["backbone"] == "partial":
-                    proto_out = self.proto_net_proxy(proto_x)
-                else:
-                    proto_out = self.proto_net(proto_x)
+                proto_out = self.proto_net(proto_x)
 
                 proto_out = cfg.mask_proto_prototype_activation(proto_out)
 
@@ -1822,11 +1748,7 @@ class Yolact(nn.Module):
             if cfg.use_instance_coeff:
                 pred_outs['inst'] = []
 
-            prediction_layers = self.prediction_layers_proxy \
-                if cfg.flow is not None and cfg.flow.pred_heads_no_conflict and extras["backbone"] == "partial" \
-                else self.prediction_layers
-            
-            for idx, pred_layer in zip(self.selected_layers, prediction_layers):
+            for idx, pred_layer in zip(self.selected_layers, self.prediction_layers):
                 pred_x = outs[idx]
 
                 if cfg.mask_type == mask_type.lincomb and cfg.mask_proto_prototypes_as_features:
@@ -1837,8 +1759,8 @@ class Yolact(nn.Module):
                 # This is re-enabled during training or non-TRT inference.
                 if self.training or not (cfg.torch2trt_prediction_module or cfg.torch2trt_prediction_module_int8):
                     # A hack for the way dataparallel works
-                    if cfg.share_prediction_module and pred_layer is not prediction_layers[0]:
-                        pred_layer.parent = [prediction_layers[0]]
+                    if cfg.share_prediction_module and pred_layer is not self.prediction_layers[0]:
+                        pred_layer.parent = [self.prediction_layers[0]]
 
                 p = pred_layer(pred_x)
                 
@@ -1872,8 +1794,7 @@ class Yolact(nn.Module):
             else:
                 pred_outs['conf'] = F.softmax(pred_outs['conf'], -1)
 
-            extras = {}
-            outs_wrapper["pred_outs"] = self.detect(pred_outs, extras=extras)
+            outs_wrapper["pred_outs"] = self.detect(pred_outs)
         return outs_wrapper
 
 

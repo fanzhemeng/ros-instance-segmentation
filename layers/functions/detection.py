@@ -1,6 +1,5 @@
 import torch
 import torch.nn.functional as F
-import torch.distributed as dist
 from ..box_utils import decode, jaccard, index2d
 from utils import timer
 
@@ -10,8 +9,6 @@ import numpy as np
 
 import pyximport
 pyximport.install(setup_args={"include_dirs":np.get_include()}, reload_support=True)
-if dist.is_initialized():
-    dist.barrier()
 from utils.cython_nms import nms as cnms
 
 
@@ -33,10 +30,10 @@ class Detect(object):
             raise ValueError('nms_threshold must be non negative.')
         self.conf_thresh = conf_thresh
         
-        self.cross_class_nms = False
+        self.use_cross_class_nms = False
         self.use_fast_nms = False
 
-    def __call__(self, predictions, extras=None):
+    def __call__(self, predictions):
         """
         Args:
              loc_data: (tensor) Loc preds from loc layers
@@ -75,7 +72,7 @@ class Detect(object):
 
             for batch_idx in range(batch_size):
                 decoded_boxes = decode(loc_data[batch_idx], prior_data)
-                result = self.detect(batch_idx, conf_preds, decoded_boxes, mask_data, inst_data, extras)
+                result = self.detect(batch_idx, conf_preds, decoded_boxes, mask_data, inst_data)
 
                 if result is not None and proto_data is not None:
                     result['proto'] = proto_data[batch_idx]
@@ -85,7 +82,7 @@ class Detect(object):
         return out
 
 
-    def detect(self, batch_idx, conf_preds, decoded_boxes, mask_data, inst_data, extras=None):
+    def detect(self, batch_idx, conf_preds, decoded_boxes, mask_data, inst_data):
         """ Perform nms for only the max scoring class that isn't background (class 0) """
         cur_scores = conf_preds[batch_idx, 1:, :]
         conf_scores, _ = torch.max(cur_scores, dim=0)
@@ -102,7 +99,10 @@ class Detect(object):
             return None
         
         if self.use_fast_nms:
-            boxes, masks, classes, scores = self.fast_nms(boxes, masks, scores, self.nms_thresh, self.top_k)
+            if self.use_cross_class_nms:
+                boxes, masks, classes, scores = self.cc_fast_nms(boxes, masks, scores, self.nms_thresh, self.top_k)
+            else:
+                boxes, masks, classes, scores = self.fast_nms(boxes, masks, scores, self.nms_thresh, self.top_k)
         else:
             boxes, masks, classes, scores = self.traditional_nms(boxes, masks, scores, self.nms_thresh, self.conf_thresh)
 
@@ -135,6 +135,34 @@ class Detect(object):
         
         return idx_out, idx_out.size(0)
 
+    def cc_fast_nms(self, boxes, masks, scores, iou_threshold:float=0.5, top_k:int=200):
+        # Collapse all the classes into 1
+        scores, classes = scores.max(dim=0)
+
+        _, idx = scores.sort(0, descending=True)
+        idx = idx[:top_k]
+
+        boxes_idx = torch.index_select(boxes, 0, idx)
+
+        # Compute the pairwise IoU between the boxes
+        iou = jaccard(boxes_idx, boxes_idx)
+
+        # Zero out the lower triangle of the cosine similarity matrix and diagonal
+        iou.triu_(diagonal=1)
+
+        # Now that everything in the diagonal and below is zeroed out, if we take the max
+        # of the IoU matrix along the columns, each column will represent the maximum IoU
+        # between this element and every element with a higher score than this element.
+        iou_max, _ = torch.max(iou, dim=0)
+
+        # Now just filter out the ones greater than the threshold, i.e., only keep boxes that
+        # don't have a higher scoring box that would supress it in normal NMS.
+
+        idx_keep = torch.nonzero(iou_max <= iou_threshold, as_tuple=True)[0]
+        idx_out = torch.index_select(idx, 0, idx_keep)
+
+        return tuple([torch.index_select(x, 0, idx_out) for x in (boxes, masks, classes, scores)])
+
     def fast_nms(self, boxes, masks, scores, iou_threshold:float=0.5, top_k:int=200, second_threshold:bool=False):
         scores, idx = scores.sort(1, descending=True)
 
@@ -163,20 +191,48 @@ class Detect(object):
 
         # Assign each kept detection to its corresponding class
         classes = torch.arange(num_classes, device=boxes.device)[:, None].expand_as(keep)
-        classes = classes[keep]
 
-        boxes = boxes[keep]
-        masks = masks[keep]
-        scores = scores[keep]
-        
+        def fix_shape(classes, boxes, masks, scores):
+            num_dets = torch.numel(classes)
+
+            classes = classes.view(num_dets)
+            boxes = boxes.view(num_dets, 4)
+            masks = masks.view(num_dets, -1)
+            scores = scores.view(num_dets)
+
+            return classes, boxes, masks, scores
+
+        def flatten_index_select(x, idx, end_dim=None):
+            x = torch.flatten(x, end_dim=end_dim)
+            return torch.index_select(x, 0, idx)
+
+        if not cfg.use_tensorrt_safe_mode:
+            classes = classes[keep]
+            boxes = boxes[keep]
+            masks = masks[keep]
+            scores = scores[keep]
+        else:
+            keep = torch.flatten(keep, end_dim=1)
+            idx = torch.nonzero(keep, as_tuple=True)[0]
+
+            classes, boxes, masks, scores = [flatten_index_select(x, idx, end_dim=1)
+                                             for x in (classes, boxes, masks, scores)]
+            classes, boxes, masks, scores = fix_shape(classes, boxes, masks, scores)
+
         # Only keep the top cfg.max_num_detections highest scores across all classes
         scores, idx = scores.sort(0, descending=True)
         idx = idx[:cfg.max_num_detections]
         scores = scores[:cfg.max_num_detections]
 
-        classes = classes[idx]
-        boxes = boxes[idx]
-        masks = masks[idx]
+        if not cfg.use_tensorrt_safe_mode:
+            classes = classes[idx]
+            boxes = boxes[idx]
+            masks = masks[idx]
+        else:
+            classes = torch.index_select(classes, 0, idx)
+            boxes = torch.index_select(boxes, 0, idx)
+            masks = torch.index_select(masks, 0, idx)
+            classes, boxes, masks, scores = fix_shape(classes, boxes, masks, scores)
 
         return boxes, masks, classes, scores
 
