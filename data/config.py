@@ -230,6 +230,18 @@ youtube_vis_dataset = dataset_base.copy({
     'is_video': True
 })
 
+kuang_dataset = dataset_base.copy({
+    'name': 'Kuang Dataset',
+
+    'train_images': '../kuang-data/train',
+    'train_info':   '../kuang-data/annotations/train.json',
+
+    'valid_images': '../kuang-data/val',
+    'valid_info':   '../kuang-data/annotations/val.json',
+
+    'class_names': ('car', 'truck'),
+    'label_map': {0:1, 1:2}
+})
 
 
 
@@ -738,7 +750,7 @@ yolact_base_config = coco_base_config.copy({
     'name': 'yolact_base',
 
     # Dataset stuff
-    'dataset': coco2017_dataset,
+    'dataset': kuang_dataset,
     'num_classes': len(coco2017_dataset.class_names) + 1,
 
     # Image Size
@@ -807,6 +819,12 @@ yolact_edge_config = yolact_base_config.copy({
     'torch2trt_protonet_int8': True,
     'torch2trt_fpn': True,
     'torch2trt_prediction_module': True,
+
+    # Dataset stuff
+    'dataset': kuang_dataset,
+    'num_classes': 3,
+    'max_iter': 2000
+
 })
 
 yolact_edge_mobilenetv2_config = yolact_edge_config.copy({

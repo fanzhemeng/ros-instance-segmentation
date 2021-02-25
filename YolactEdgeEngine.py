@@ -12,6 +12,7 @@ import torch
 import torch.backends.cudnn as cudnn
 import argparse
 import os
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -137,7 +138,7 @@ class YolactEdgeEngine:
         parse_args(self)
         self.args.config = 'yolact_edge_resnet50_config'
         set_cfg(self.args.config)
-        self.args.trained_model = 'weights/yolact_edge_resnet50_54_800000.pth'
+        self.args.trained_model = '/home/ht/catkin_ws/src/instance_segmentation/scripts/weights/yolact_edge_resnet50_54_800000.pth'
         self.args.top_k = 100
         self.args.cuda = True
         self.args.fast_nms = True
@@ -352,18 +353,21 @@ class YolactEdgeEngine:
             if use_tensorrt_conversion:
                 self.logger.info("Converted to TensorRT.")
 
-    def detect(self):
+    def detect(self, img):
         with torch.no_grad():
             self.net = self.net.cuda()
-            self.evaluate()
+            self.net.detect.use_fast_nms = self.args.fast_nms
+            cfg.mask_proto_debug = self.args.mask_proto_debug
+            img_out = self.evalimage(img)
+            return img_out
 
     def evaluate(self, train_mode=False, train_cfg=None):
-        self.net.detect.use_fast_nms = self.args.fast_nms
-        cfg.mask_proto_debug = self.args.mask_proto_debug
-
-        inp, out = self.args.images.split(':')
-        self.evalimages(inp, out)
-        return
+        with torch.no_grad():
+            self.net = self.net.cuda()
+            self.net.detect.use_fast_nms = self.args.fast_nms
+            cfg.mask_proto_debug = self.args.mask_proto_debug
+            inp, out = self.args.images.split(':')
+            self.evalimages(inp, out)
 
     def evalimages(self, input_folder:str, output_folder:str):
         if not os.path.exists(output_folder):
@@ -376,12 +380,13 @@ class YolactEdgeEngine:
             name = '.'.join(name.split('.')[:-1]) + '.jpg'
             out_path = os.path.join(output_folder, name)
 
-            self.evalimage(path, out_path)
-            print(path + ' -> ' + out_path)
+            img = cv2.imread(path)
+            img_out = self.evalimage(img, out_path)
+            #print(path + ' -> ' + out_path)
         print('Done.')
 
-    def evalimage(self, path:str, save_path:str=None):
-        frame = torch.from_numpy(cv2.imread(path)).cuda().float()
+    def evalimage(self, img, save_path=None):
+        frame = torch.from_numpy(img).cuda().float()
         batch = FastBaseTransform()(frame.unsqueeze(0))
 
         if cfg.flow.warp_mode != 'none':
@@ -389,10 +394,14 @@ class YolactEdgeEngine:
 
         extras = {"backbone": "full", "interrupt": False, "keep_statistics": False, "moving_statistics": None}
 
+        start_time = time.time()
         preds = self.net(batch, extras=extras)["pred_outs"]
+        end_time = time.time()
+        print('%.3f' % (end_time-start_time))
 
         img_numpy = self.prep_display(preds, frame, None, None, undo_transform=False)
-        #cv2.imwrite(save_path, img_numpy)
+        if save_path:
+            cv2.imwrite(save_path, img_numpy)
         return img_numpy
 
     def prep_display(self, dets_out, img, h, w, undo_transform=True, class_color=False, mask_alpha=0.45):
@@ -489,7 +498,7 @@ class YolactEdgeEngine:
                     cv2.putText(img_numpy, text_str, text_pt, font_face, font_scale, text_color, font_thickness, cv2.LINE_AA)
         return img_numpy
 
-if __name__ == '__main__':
-    engine = YolactEdgeEngine()
-    engine.detect()
+#if __name__ == '__main__':
+#    engine = YolactEdgeEngine()
+#    engine.evaluate()
 
